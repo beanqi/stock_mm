@@ -135,7 +135,13 @@ impl GateRest {
 
     pub async fn positions(&self, contract: &str, dual: bool) -> Result<Vec<PositionInfo>> {
         let path = if dual { self.path(&format!("/dual_comp/positions/{contract}")) } else { self.path(&format!("/positions/{contract}")) };
-        let v = self.request(Method::GET, &path, "", None, true).await?;
+        // Gate 400s with POSITION_NOT_FOUND when this contract has never had a
+        // position (or was fully closed and the record dropped). That is flat.
+        let v = match self.request(Method::GET, &path, "", None, true).await {
+            Ok(v) => v,
+            Err(e) if is_position_not_found(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let list: Vec<GatePosition> = match v {
             Value::Array(_) => serde_json::from_value(v).context("parse positions")?,
             other => vec![serde_json::from_value(other).context("parse position")?],
@@ -254,6 +260,23 @@ impl GateRest {
                 }
             }
         }
+    }
+}
+
+fn is_position_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<GateError>().is_some_and(|g| g.label == "POSITION_NOT_FOUND")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_not_found_is_flat() {
+        let err = GateError { status: 400, label: "POSITION_NOT_FOUND".into(), message: String::new() }.into();
+        assert!(is_position_not_found(&err));
+        let other: anyhow::Error = GateError { status: 400, label: "INVALID".into(), message: String::new() }.into();
+        assert!(!is_position_not_found(&other));
     }
 }
 
