@@ -717,13 +717,20 @@ impl Engine {
         self.protection.update(velocity, delta, impact, now);
         if let Some(strong) = self.protection.strong_side() {
             // Spec §4.3: with inventory *against* a strong move we do not wait for
-            // an ideal maker fill – flatten the adverse side actively.
+            // an ideal maker fill – reduce the adverse side actively.
+            //
+            // Only when the inventory is already *outside* the band, and only back
+            // to the band (not to flat). Live data showed that flattening a
+            // within-band 1–2 contract position 200 ms after a sweep chases the
+            // move at taker and was a net loser; inside the band the strong-side
+            // protection already cancels opens on the endangered side, which is
+            // enough.
             let against = match strong {
                 Side::Sell => local_pos.short > 0 && local_pos.net() < 0, // rising hard while net short
                 Side::Buy => local_pos.long > 0 && local_pos.net() > 0,   // falling hard while net long
             };
-            if against && self.reduce.trigger(ReduceReason::StrongAgainstInventory, 0, f, now) {
-                warn!(velocity, long = local_pos.long, short = local_pos.short, "strong move against inventory: active reduce");
+            if against && !snap.in_band && self.reduce.trigger(ReduceReason::StrongAgainstInventory, band_c, f, now) {
+                warn!(velocity, q_usdt = snap.q_usdt, long = local_pos.long, short = local_pos.short, "strong move against out-of-band inventory: active reduce to band");
                 self.episode_used_reduce = true;
             }
         }

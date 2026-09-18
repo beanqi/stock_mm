@@ -34,7 +34,7 @@ drift_warn_bps           = 3.0   # |β_5m − β0| 超过该值打印告警
 
 # ---- 三、报价 ----
 [quoting]
-min_half_spread_bps   = 2.0    # δ_配置：最小基础半点差（bps）
+min_half_spread_bps   = 4.0    # δ_配置：最小基础半点差（bps）。实盘 buy 侧 1 s markout ≈ -1.2~-1.9 bps，Gate 外部盘口 1.2~2.5 bps，2 bps 会被逆向选择吃光
 fee_buffer_bps        = 0.5    # e：费用之外的安全空间；δ ≥ f_m + e
 vol_window_secs       = 300    # V90：最近 5 分钟
 vol_step_ms           = 200    # 200 ms 绝对价格变动
@@ -51,8 +51,8 @@ aggressive_reduce_u   = 0.5    # |u| ≥ 0.5 时减仓侧可压到 ceil(max(A_li
 [inventory]
 max_net_usdt    = 300.0   # H：净库存硬上限 ≈ 18 张（由损失预算与 Gate 可退出深度决定，不是杠杆）
 max_gross_usdt  = 300.0   # 双向模式下 多+空 总持仓上限
-band_ratio      = 0.1     # 目标带 ±0.1H = ±30 USDT，能容纳 1 张成交而不立刻触发主动减仓
-band_timeout_ms = 3000    # 库存在带外持续 3 秒 → 停止加仓并主动减回目标带
+band_ratio      = 0.3     # 目标带 ±0.3H = ±90 USDT ≈ 5 张：一侧三层（3 张 ≈ 49 USDT）全被扫也不出带；0.1H 时 2 张就出带，几乎每次多层成交都触发 IOC
+band_timeout_ms = 60000   # 库存在带外持续 60 秒 → 停止加仓并主动减回目标带；先让 maker 减仓单（含 aggressive_reduce）消化，IOC 只作最后手段
 stop_add_u      = 0.5     # |u| ≥ 0.5 不再新增风险
 
 # ---- 四、危险信号与按侧保护 ----
@@ -73,9 +73,9 @@ recover_full_ms             = 2000  # 连续稳定 2 s 后恢复全量
 
 # ---- 五、主动减仓（带价格保护的 reduce_only IOC）与应急退出 ----
 [exit]
-ioc_max_slippage_bps    = 15.0  # IOC 限价相对 F 的最大偏离
+ioc_max_slippage_bps    = 4.0   # IOC 限价相对 F 的最大偏离（≈ 1δ；原 15 bps 是 δ 的 7 倍，减仓单笔就能亏掉多笔做市利润）
 ioc_retry_interval_ms   = 200   # 部分成交后重算盘口再发下一笔的最小间隔
-ioc_timeout_ms          = 5000  # 超过此时限仍有余仓 → 升级应急退出
+ioc_timeout_ms          = 30000 # 超过此时限仍有余仓 → 升级应急退出（配合 4 bps 的 IOC 上限：盘口暂时没有 4 bps 内的深度时要多等几轮，不能 5 s 就升级成市价单+停机）
 cancel_wait_ms          = 800   # 发 IOC 前等待冲突挂单撤销确认的时间
 emergency               = "market_then_halt"  # 或 "halt_only"
 emergency_max_attempts  = 3
