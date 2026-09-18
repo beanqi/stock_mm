@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
                 key: creds.gate_key.clone(),
                 secret: creds.gate_secret.clone(),
                 rest: rest.clone(),
+                pool_size: cfg.endpoints.gate_trade_ws_pool,
             };
             tokio::spawn(trade.run(crx, tx.clone()));
             let private = exchange::gate_private::GatePrivate {

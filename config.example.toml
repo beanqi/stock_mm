@@ -15,6 +15,8 @@ binance_ws   = "wss://fstream.binance.com/stream"
 binance_rest = "https://fapi.binance.com"
 gate_ws      = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 gate_rest    = "https://api.gateio.ws"
+# 交易 WS 解析域名多次，钉到最多 N 个不同 IP，下单在这些连接上轮询，避免打到同一台 Gate 被限频
+gate_trade_ws_pool = 6
 
 # ---- 二、合理价格 F = M_B (1 + β0/1e4) ----
 [pricing]

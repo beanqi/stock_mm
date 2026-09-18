@@ -68,6 +68,7 @@ cargo test                                 # 65 个单元/集成测试
 ## 关键实现选择（与方案原文有关的假设）
 
 - **不使用 `nb-arbitrage`**：该私有库的永续交易/订单/资产模块只支持 Binance/Bybit/Aster，没有 Gate 永续，因此本项目自带 Gate 永续的 REST、公共/私有 WS 与 WS 交易 API（`futures.login` / `order_place` / `order_amend` / `order_cancel`，REST 兜底）。
+- **交易 WS 多 IP 轮询**：live 下单会反复解析 `gate_ws` 域名，钉到最多 `gate_trade_ws_pool`（默认 6）个不同 IP，place/amend/cancel 在这些已登录连接上轮询，把限频摊到不同 Gate 后端；解析不到多个 IP 时退回单连接。
 - **双向持仓模式**：按方案实现映射（卖单优先平多、买单优先平空），同时兼容单向模式（reduce_only 语义一致）。启动时读取账户 `in_dual_mode`，运行中变化会告警。
 - **"被自己主导"的判定**：β 样本用扣除自身订单后的外部盘口；若外部盘口宽于 `basis_max_ext_spread_bps`（默认 15 bps）视为无信息，不计入样本。
 - **Gate 冲击信号**默认按"轻度"处理（`impact_is_strong = false`），与 v₁₀₀ 叠加时取更强者。

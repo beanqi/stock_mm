@@ -98,6 +98,10 @@ pub struct Endpoints {
     pub binance_rest: String,
     pub gate_ws: String,
     pub gate_rest: String,
+    /// Distinct Gate futures WS IPs to pin trade connections to.
+    /// Place/amend/cancel rotate across them so a single backend's rate
+    /// limit is not the bottleneck. `1` disables pinning (hostname only).
+    pub gate_trade_ws_pool: usize,
 }
 
 impl Default for Endpoints {
@@ -107,6 +111,7 @@ impl Default for Endpoints {
             binance_rest: "https://fapi.binance.com".into(),
             gate_ws: "wss://fx-ws.gateio.ws/v4/ws/usdt".into(),
             gate_rest: "https://api.gateio.ws".into(),
+            gate_trade_ws_pool: 6,
         }
     }
 }
@@ -496,6 +501,10 @@ impl Config {
         );
         anyhow::ensure!(self.orders.client_id_prefix.starts_with("t-"), "orders.client_id_prefix must start with 't-'");
         anyhow::ensure!(
+            (1..=16).contains(&self.endpoints.gate_trade_ws_pool),
+            "endpoints.gate_trade_ws_pool must be in 1..=16"
+        );
+        anyhow::ensure!(
             self.pricing.dstop_quantile > 0.0 && self.pricing.dstop_quantile <= 1.0,
             "pricing.dstop_quantile must be in (0,1]"
         );
@@ -519,6 +528,7 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.quoting.layers, 3);
         assert_eq!(cfg.inventory.band_ratio, 0.1);
+        assert_eq!(cfg.endpoints.gate_trade_ws_pool, 6);
     }
 
     #[test]

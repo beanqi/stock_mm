@@ -6,8 +6,12 @@
 //! - When the socket drops with requests outstanding, every outstanding request
 //!   is resolved as `UNKNOWN` so the order manager queries instead of assuming.
 //! - Queries and cancel-all always go through REST.
+//! - Place/amend/cancel are load-balanced across several WS sessions, each
+//!   pinned to a distinct resolved IP of `gate_ws`, so Gate's per-server
+//!   rate limits are not concentrated on a single backend.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,6 +36,7 @@ pub struct TradeCommand {
     pub side: Side,
 }
 
+#[derive(Clone)]
 pub struct GateTradeWs {
     pub ws_url: String,
     pub contract: String,
@@ -39,10 +44,13 @@ pub struct GateTradeWs {
     pub key: String,
     pub secret: String,
     pub rest: Arc<GateRest>,
+    /// Distinct Gate WS backends to pin. `1` keeps a single hostname connection.
+    pub pool_size: usize,
 }
 
 const LOGIN_REQ: &str = "login-1";
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const RESOLVE_LOOKUPS: usize = 8;
 
 impl GateTradeWs {
     fn login_request(&self) -> Value {
@@ -64,7 +72,15 @@ impl GateTradeWs {
 
     fn api_request(&self, cmd: &ExecCommand, side: Side) -> Option<(String, Value)> {
         let (channel, param) = match cmd {
-            ExecCommand::Place { client_id, side, size, price, tif, reduce_only, .. } => {
+            ExecCommand::Place {
+                client_id,
+                side,
+                size,
+                price,
+                tif,
+                reduce_only,
+                ..
+            } => {
                 let mut p = json!({
                     "contract": self.contract,
                     "size": size * side.sign(),
@@ -77,7 +93,12 @@ impl GateTradeWs {
                 }
                 ("futures.order_place", p)
             }
-            ExecCommand::Amend { exchange_id, price, size, .. } => {
+            ExecCommand::Amend {
+                exchange_id,
+                price,
+                size,
+                ..
+            } => {
                 let mut p = json!({"order_id": exchange_id});
                 if let Some(t) = price {
                     p["price"] = json!(self.grid.to_string(*t));
@@ -87,7 +108,11 @@ impl GateTradeWs {
                 }
                 ("futures.order_amend", p)
             }
-            ExecCommand::Cancel { exchange_id, client_id, .. } => {
+            ExecCommand::Cancel {
+                exchange_id,
+                client_id,
+                ..
+            } => {
                 let id = exchange_id.clone().unwrap_or_else(|| client_id.clone());
                 ("futures.order_cancel", json!({"order_id": id}))
             }
@@ -106,15 +131,137 @@ impl GateTradeWs {
         let grid = self.grid;
         tokio::spawn(async move {
             let result = rest.execute(&contract, &tc.cmd, Some(tc.side), &grid).await;
-            let _ = tx.send(Event::Exec(ExecResponse { req_id: tc.cmd.req_id().to_string(), result, at: Instant::now() })).await;
+            let _ = tx
+                .send(Event::Exec(ExecResponse {
+                    req_id: tc.cmd.req_id().to_string(),
+                    result,
+                    at: Instant::now(),
+                }))
+                .await;
         });
     }
 
-    pub async fn run(self, mut cmd_rx: mpsc::Receiver<TradeCommand>, tx: mpsc::Sender<Event>) {
-        let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(30));
+    pub async fn run(self, cmd_rx: mpsc::Receiver<TradeCommand>, tx: mpsc::Sender<Event>) {
+        if self.pool_size <= 1 {
+            self.run_session(None, 0, cmd_rx, tx, None).await;
+            return;
+        }
+        let ips = match ws::parse_ws_authority(&self.ws_url) {
+            Ok((host, port, true)) => {
+                let ips =
+                    ws::resolve_unique_ips(&host, port, self.pool_size, RESOLVE_LOOKUPS).await;
+                info!(host = %host, want = self.pool_size, n = ips.len(), ?ips, "gate trade: resolved WS backends");
+                ips
+            }
+            Ok((host, _, false)) => {
+                warn!(host = %host, "gate trade: non-TLS ws url cannot pin IPs");
+                Vec::new()
+            }
+            Err(e) => {
+                warn!(error = %e, "gate trade: bad ws url; using hostname connection");
+                Vec::new()
+            }
+        };
+        if ips.is_empty() {
+            warn!("gate trade: no distinct IPs; falling back to a single hostname connection");
+            self.run_session(None, 0, cmd_rx, tx, None).await;
+            return;
+        }
+        if ips.len() < self.pool_size {
+            warn!(
+                got = ips.len(),
+                want = self.pool_size,
+                "gate trade: fewer backends than pool_size"
+            );
+        }
+        self.run_pool(ips, cmd_rx, tx).await;
+    }
+
+    async fn run_pool(
+        self,
+        ips: Vec<IpAddr>,
+        mut cmd_rx: mpsc::Receiver<TradeCommand>,
+        tx: mpsc::Sender<Event>,
+    ) {
+        let n = ips.len();
+        let (status_tx, mut status_rx) = mpsc::channel::<(usize, bool)>(n * 4);
+        let mut senders = Vec::with_capacity(n);
+        for (slot, ip) in ips.into_iter().enumerate() {
+            let (wtx, wrx) = mpsc::channel(512);
+            senders.push(wtx);
+            let this = self.clone();
+            let ev = tx.clone();
+            let st = status_tx.clone();
+            tokio::spawn(async move {
+                this.run_session(Some(ip), slot, wrx, ev, Some(st)).await;
+            });
+        }
+        drop(status_tx);
+
+        let mut live = vec![false; n];
+        let mut live_n = 0usize;
+        let mut any_live = false;
+        let mut next = 0usize;
+        let mut status_open = true;
         loop {
-            info!(url = %self.ws_url, "gate trade: connecting");
-            let conn = ws::connect(&self.ws_url).await;
+            tokio::select! {
+                c = cmd_rx.recv() => {
+                    let Some(tc) = c else { return };
+                    dispatch_cmd(&self, &senders, &live, &mut next, tc, &tx);
+                }
+                s = status_rx.recv(), if status_open => {
+                    let Some((slot, connected)) = s else {
+                        status_open = false;
+                        continue;
+                    };
+                    if slot >= n || live[slot] == connected {
+                        continue;
+                    }
+                    live[slot] = connected;
+                    if connected {
+                        live_n += 1;
+                    } else {
+                        live_n = live_n.saturating_sub(1);
+                    }
+                    let now_any = live_n > 0;
+                    if now_any != any_live {
+                        any_live = now_any;
+                        let _ = tx.send(Event::FeedStatus { feed: Feed::GateTrade, connected: any_live, at: Instant::now() }).await;
+                    }
+                    info!(slot, connected, live = live_n, n, "gate trade: pool member");
+                }
+            }
+        }
+    }
+
+    async fn run_session(
+        &self,
+        pin: Option<IpAddr>,
+        slot: usize,
+        mut cmd_rx: mpsc::Receiver<TradeCommand>,
+        tx: mpsc::Sender<Event>,
+        status_tx: Option<mpsc::Sender<(usize, bool)>>,
+    ) {
+        let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(30));
+        let publish_status = |connected: bool,
+                              status_tx: &Option<mpsc::Sender<(usize, bool)>>,
+                              tx: &mpsc::Sender<Event>| {
+            if let Some(st) = status_tx {
+                let _ = st.try_send((slot, connected));
+            } else {
+                let _ = tx.try_send(Event::FeedStatus {
+                    feed: Feed::GateTrade,
+                    connected,
+                    at: Instant::now(),
+                });
+            }
+        };
+        loop {
+            info!(slot, ip = ?pin, url = %self.ws_url, "gate trade: connecting");
+            let conn = match pin {
+                Some(ip) => ws::connect_via_ip(&self.ws_url, ip).await,
+                None => ws::connect(&self.ws_url).await,
+            };
             let (mut sink, mut source) = match conn {
                 Ok(c) => c,
                 Err(e) => {
@@ -134,7 +281,10 @@ impl GateTradeWs {
                 }
             };
             // Login.
-            if ws::send_text(&mut sink, self.login_request().to_string()).await.is_err() {
+            if ws::send_text(&mut sink, self.login_request().to_string())
+                .await
+                .is_err()
+            {
                 tokio::time::sleep(backoff.next()).await;
                 continue;
             }
@@ -157,7 +307,7 @@ impl GateTradeWs {
                                     let status = header_status(&v);
                                     if status == 200 {
                                         logged_in = true;
-                                        info!("gate trade: logged in");
+                                        info!(slot, ip = ?pin, "gate trade: logged in");
                                     } else {
                                         warn!(%text, "gate trade: login rejected");
                                         break;
@@ -174,7 +324,7 @@ impl GateTradeWs {
                 continue;
             }
             backoff.reset();
-            let _ = tx.send(Event::FeedStatus { feed: Feed::GateTrade, connected: true, at: Instant::now() }).await;
+            publish_status(true, &status_tx, &tx);
 
             let mut pending: HashMap<String, (TradeCommand, Instant)> = HashMap::new();
             let mut ping = tokio::time::interval(Duration::from_secs(15));
@@ -239,16 +389,63 @@ impl GateTradeWs {
                     }
                 }
             }
-            let _ = tx.send(Event::FeedStatus { feed: Feed::GateTrade, connected: false, at: Instant::now() }).await;
+            publish_status(false, &status_tx, &tx);
             // Outstanding requests have unknown outcomes.
             for (req_id, (_, _)) in pending.drain() {
                 let _ = tx
-                    .send(Event::Exec(ExecResponse { req_id, result: ExecResult::Error { label: "UNKNOWN".into(), message: "ws disconnected".into() }, at: Instant::now() }))
+                    .send(Event::Exec(ExecResponse {
+                        req_id,
+                        result: ExecResult::Error {
+                            label: "UNKNOWN".into(),
+                            message: "ws disconnected".into(),
+                        },
+                        at: Instant::now(),
+                    }))
                     .await;
             }
             tokio::time::sleep(backoff.next()).await;
         }
     }
+}
+
+fn dispatch_cmd(
+    trade: &GateTradeWs,
+    senders: &[mpsc::Sender<TradeCommand>],
+    live: &[bool],
+    next: &mut usize,
+    tc: TradeCommand,
+    tx: &mpsc::Sender<Event>,
+) {
+    let n = senders.len();
+    if n == 0 {
+        trade.spawn_rest(tc, tx.clone());
+        return;
+    }
+    for k in 0..n {
+        let i = (*next + k) % n;
+        if !live[i] {
+            continue;
+        }
+        match senders[i].try_send(tc.clone()) {
+            Ok(()) => {
+                *next = (i + 1) % n;
+                return;
+            }
+            Err(_) => continue,
+        }
+    }
+    *next = (*next + 1) % n;
+    trade.spawn_rest(tc, tx.clone());
+}
+
+/// First live slot at or after `start`, wrapping around. `None` if every slot is down.
+#[cfg(test)]
+fn next_live_slot(live: &[bool], start: usize) -> Option<usize> {
+    let n = live.len();
+    if n == 0 {
+        return None;
+    }
+    (0..n).map(|k| (start + k) % n).find(|&i| live[i])
 }
 
 fn header_status(v: &Value) -> u16 {
@@ -270,15 +467,31 @@ pub fn parse_api_response(v: &Value, grid: &TickGrid) -> Option<(String, ExecRes
     }
     let data = v.get("data")?;
     if let Some(errs) = data.get("errs").filter(|e| !e.is_null()) {
-        let label = errs.get("label").and_then(|l| l.as_str()).unwrap_or("ERROR").to_string();
-        let message = errs.get("message").and_then(|l| l.as_str()).unwrap_or("").to_string();
+        let label = errs
+            .get("label")
+            .and_then(|l| l.as_str())
+            .unwrap_or("ERROR")
+            .to_string();
+        let message = errs
+            .get("message")
+            .and_then(|l| l.as_str())
+            .unwrap_or("")
+            .to_string();
         return Some((req_id, ExecResult::Error { label, message }));
     }
     let status = header_status(v);
     let result = data.get("result")?;
     if status != 200 && status != 0 {
-        let label = result.get("label").and_then(|l| l.as_str()).unwrap_or("ERROR").to_string();
-        let message = result.get("message").and_then(|l| l.as_str()).unwrap_or("").to_string();
+        let label = result
+            .get("label")
+            .and_then(|l| l.as_str())
+            .unwrap_or("ERROR")
+            .to_string();
+        let message = result
+            .get("message")
+            .and_then(|l| l.as_str())
+            .unwrap_or("")
+            .to_string();
         return Some((req_id, ExecResult::Error { label, message }));
     }
     let order: GateOrder = serde_json::from_value(result.clone()).ok()?;
@@ -313,5 +526,16 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn round_robin_skips_dead_slots() {
+        assert_eq!(next_live_slot(&[true, true, true], 0), Some(0));
+        assert_eq!(next_live_slot(&[false, true, false], 0), Some(1));
+        assert_eq!(next_live_slot(&[false, false, true], 0), Some(2));
+        assert_eq!(next_live_slot(&[true, false, true], 1), Some(2));
+        assert_eq!(next_live_slot(&[true, false, false], 1), Some(0));
+        assert_eq!(next_live_slot(&[false, false, false], 0), None);
+        assert_eq!(next_live_slot(&[], 0), None);
     }
 }
