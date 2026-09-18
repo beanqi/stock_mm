@@ -1,5 +1,4 @@
 /target
 .env
 *.jsonl
-config.toml
 /logs
