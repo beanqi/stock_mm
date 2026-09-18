@@ -1,0 +1,115 @@
+# stock_mm 配置示例 —— Binance SNDKUSDT 定价、Gate SNDK_USDT 做市
+# 所有字段都有默认值（见 `stock_mm --print-default-config`），只需覆盖需要修改的项。
+# API 密钥不放在此文件：使用环境变量 GATE_API_KEY / GATE_API_SECRET（或 .env）。
+
+# "paper"：连接真实行情，订单在本地模拟；"live"：在 Gate 真实下单
+mode = "paper"
+
+[instruments]
+binance_symbol = "SNDKUSDT"   # 只提供参考价
+gate_contract  = "SNDK_USDT"  # 全部开仓/减仓/平仓在此完成
+gate_settle    = "usdt"
+
+[endpoints]
+binance_ws   = "wss://fstream.binance.com/stream"
+binance_rest = "https://fapi.binance.com"
+gate_ws      = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+gate_rest    = "https://api.gateio.ws"
+
+# ---- 二、合理价格 F = M_B (1 + β0/1e4) ----
+[pricing]
+basis_window_secs        = 3600  # β0 主窗口：最近 1 小时同类时段有效 β_t 的中位数
+drift_window_secs        = 300   # 5 分钟窗口只用于观察基差漂移（不参与 β0）
+basis_min_samples        = 300   # 本时段有效样本不足时不开新仓
+basis_sample_interval_ms = 200   # 样本抽稀间隔
+basis_sync_tolerance_ms  = 400   # 两边行情本地接收时间差超过此值 → 不计入样本
+basis_max_ext_spread_bps = 15.0  # 扣除自身订单后的 Gate 外部盘口过宽（被自己主导/无信息）→ 不计入样本
+dstop_delta_mult         = 5.0   # D_stop = max(5δ, 正常样本 D 的 99% 分位)
+dstop_quantile           = 0.99
+basis_recover_ratio      = 0.5   # 恢复条件：D ≤ D_stop × 0.5 ...
+basis_recover_ms         = 10000 # ... 且持续 10 秒；不是固定倒计时后自动恢复
+drift_warn_bps           = 3.0   # |β_5m − β0| 超过该值打印告警
+
+# ---- 三、报价 ----
+[quoting]
+min_half_spread_bps   = 2.0    # δ_配置：最小基础半点差（bps）
+fee_buffer_bps        = 0.5    # e：费用之外的安全空间；δ ≥ f_m + e
+vol_window_secs       = 300    # V90：最近 5 分钟
+vol_step_ms           = 200    # 200 ms 绝对价格变动
+vol_quantile          = 0.90
+layers                = 3      # 每侧最多三层
+layer_offsets_delta   = [0.5, 1.25]  # 第二/三层相对内层的距离（δ 的倍数）
+layer_notional_ratio  = 0.05   # 每层基准金额 v = 0.05 H
+inner_requote_ticks   = 2      # 内层安全订单目标价变化 ≥ 2 tick 才跟随
+outer_requote_ticks   = 4      # 外层更宽松
+size_requote_ratio    = 0.3    # 数量偏差 >30% 才改量（减量总是执行，保留队列）
+aggressive_reduce_u   = 0.5    # |u| ≥ 0.5 时减仓侧可压到 ceil(max(A_limit, G_bid+tick))
+
+# ---- 库存 ----
+[inventory]
+max_net_usdt    = 5000.0  # H：净库存硬上限（由损失预算与 Gate 可退出深度决定，不是杠杆）
+max_gross_usdt  = 5000.0  # 双向模式下 多+空 总持仓上限
+band_ratio      = 0.1     # 目标带 ±0.1H
+band_timeout_ms = 3000    # 库存在带外持续 3 秒 → 停止加仓并主动减回目标带
+stop_add_u      = 0.5     # |u| ≥ 0.5 不再新增风险
+
+# ---- 四、危险信号与按侧保护 ----
+[protection]
+light_velocity_delta        = 1.0   # |v100| ≥ 1δ → 轻度保护
+strong_velocity_delta       = 2.0   # |v100| ≥ 2δ → 强保护
+velocity_window_ms          = 100
+impact_window_ms            = 100   # Gate 主动成交窗口
+impact_share                = 0.8   # 单边占比 > 80%
+impact_quantile             = 0.95  # 且窗口成交额 > 正常样本 95% 分位
+impact_history_secs         = 1800
+impact_is_strong            = false # Gate 冲击按轻度处理（true 则按强保护）
+light_size_mult             = 0.5   # 轻度：数量减半
+light_distance_mult         = 1.5   # 轻度：报价距离 1.5 倍
+strong_other_side_size_mult = 0.5   # 强保护：另一侧最多半量并紧跟合理价
+recover_half_ms             = 500   # 信号消失 500 ms 后恢复半量
+recover_full_ms             = 2000  # 连续稳定 2 s 后恢复全量
+
+# ---- 五、主动减仓（带价格保护的 reduce_only IOC）与应急退出 ----
+[exit]
+ioc_max_slippage_bps    = 15.0  # IOC 限价相对 F 的最大偏离
+ioc_retry_interval_ms   = 200   # 部分成交后重算盘口再发下一笔的最小间隔
+ioc_timeout_ms          = 5000  # 超过此时限仍有余仓 → 升级应急退出
+cancel_wait_ms          = 800   # 发 IOC 前等待冲突挂单撤销确认的时间
+emergency               = "market_then_halt"  # 或 "halt_only"
+emergency_max_attempts  = 3
+resume_after_escalation = false # 升级后不自动回到正常做市
+liquidate_on_shutdown   = false # Ctrl-C：只撤单（false）/ 撤单并清仓（true）
+
+# ---- 六、可信性与风控 ----
+[risk]
+loss_limit_usdt             = 200.0  # 真实权益（已实现+未实现−费用+资金费）回撤达此值 → 清仓停止
+binance_stale_ms            = 5000
+gate_stale_ms               = 5000
+private_stale_ms            = 30000
+account_poll_ms             = 2000   # 可用保证金以交易所快照为准（撤单成功 ≠ 资金可用）
+position_mismatch_tolerance = 0
+position_mismatch_ms        = 2000   # 本地与交易所持仓不一致持续 2 s → 不可信
+margin_leverage             = 5.0    # 估算下单保证金用
+margin_buffer_usdt          = 50.0
+mark_deviation_bps          = 50.0   # |F/Gate 标记价 − 1| 超过该值视为异常 → 不新增风险（标记/指数价只做检查，不做可成交价）
+
+[orders]
+client_id_prefix    = "t-mm"  # Gate 的 text 必须以 t- 开头
+inflight_timeout_ms = 3000    # 在途请求超时 → 查询订单，不重发
+use_amend           = true
+timer_ms            = 50      # 风控定时事件
+
+# ---- 交易时段 ----
+[session]
+timezone      = "America/New_York"
+tradable      = ["regular", "pre", "post", "overnight"]  # 周末默认不开新仓
+holidays      = []            # 例如 ["2026-11-26"]
+event_windows = []            # 例如 [["2026-10-29T20:00:00Z", "2026-10-30T14:30:00Z"]]（财报）
+force_session = ""            # 调试用：强制单一时段，如 "regular"
+
+[metrics]
+snapshot_ms = 10000
+file        = "metrics.jsonl"  # 每 10 秒追加一条 JSON：markout / 库存消化 / 退出成本 / 真实权益
+
+[paper]
+balance_usdt = 10000.0
