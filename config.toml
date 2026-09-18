@@ -39,7 +39,7 @@ vol_step_ms           = 200    # 200 ms 绝对价格变动
 vol_quantile          = 0.90
 layers                = 3      # 每侧最多三层
 layer_offsets_delta   = [0.5, 1.25]  # 第二/三层相对内层的距离（δ 的倍数）
-layer_notional_ratio  = 0.05   # 每层基准金额 v = 0.05 H = 5 USDT
+layer_notional_ratio  = 0.1    # 每层基准金额 v = 0.1 H = 30 USDT ≈ 1 张（SNDK_USDT 1 张 = 0.01 × 价格 ≈ 16 USDT，必须 ≥ 1 张否则不挂单）
 inner_requote_ticks   = 2      # 内层安全订单目标价变化 ≥ 2 tick 才跟随
 outer_requote_ticks   = 4      # 外层更宽松
 size_requote_ratio    = 0.3    # 数量偏差 >30% 才改量（减量总是执行，保留队列）
@@ -47,9 +47,9 @@ aggressive_reduce_u   = 0.5    # |u| ≥ 0.5 时减仓侧可压到 ceil(max(A_li
 
 # ---- 库存 ----
 [inventory]
-max_net_usdt    = 100.0   # H：净库存硬上限（由损失预算与 Gate 可退出深度决定，不是杠杆）
-max_gross_usdt  = 100.0   # 双向模式下 多+空 总持仓上限
-band_ratio      = 0.1     # 目标带 ±0.1H
+max_net_usdt    = 300.0   # H：净库存硬上限 ≈ 18 张（由损失预算与 Gate 可退出深度决定，不是杠杆）
+max_gross_usdt  = 300.0   # 双向模式下 多+空 总持仓上限
+band_ratio      = 0.1     # 目标带 ±0.1H = ±30 USDT，能容纳 1 张成交而不立刻触发主动减仓
 band_timeout_ms = 3000    # 库存在带外持续 3 秒 → 停止加仓并主动减回目标带
 stop_add_u      = 0.5     # |u| ≥ 0.5 不再新增风险
 
